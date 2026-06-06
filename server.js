@@ -1,37 +1,18 @@
 /**
  * Hex Prototype — WebSocket Relay Server
  *
- * Free hosting options:
- *   Railway.app  → connect your GitHub repo, deploy automatically
- *   Render.com   → "New Web Service" from GitHub, free tier
- *   Fly.io       → `fly launch` from this folder
- *
- * Run locally for testing:
- *   npm install
- *   node server.js
- * Then set RELAY_URL in NetworkManager.gd to "ws://localhost:8080"
- *
- * After deploying, set RELAY_URL to your deployed URL, e.g.:
- *   "wss://your-app.railway.app"
- *
- * Message types (client → server):
- *   host          { name? }          — create a named public lobby
- *   join          { code }           — join lobby by code
- *   list                             — list open lobbies
- *   matchmake                        — enter matchmaking queue
- *   cancel_matchmake                 — leave matchmaking queue
- *   start                            — host starts the game
- *   game          { action, data }   — relay game state to peer
+ * Run locally: npm install && node server.js
+ * Deploy to Render / Railway / Fly.io and set RELAY_URL in NetworkManager.gd.
  */
 
 const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 const wss  = new WebSocket.Server({ port: PORT });
 
-/** code → { host, guest, name, createdAt } */
+/** code → { host, guest, name, createdAt, host_username, guest_username } */
 const lobbies = new Map();
 
-/** matchmaking queue: array of WebSocket */
+/** matchmaking queue */
 const mmQueue = [];
 
 function genCode() {
@@ -51,7 +32,7 @@ function openLobbies() {
   const now = Date.now();
   const out = [];
   for (const [code, lobby] of lobbies) {
-    if (!lobby.guest)
+    if (!lobby.guest && lobby.host)
       out.push({ code, name: lobby.name, age: Math.floor((now - lobby.createdAt) / 1000) });
   }
   return out;
@@ -65,19 +46,22 @@ function removeFromQueue(ws) {
 function startMatchmakedGame(ws1, ws2) {
   let code;
   do { code = genCode(); } while (lobbies.has(code));
-  lobbies.set(code, { host: ws1, guest: ws2, name: 'Matched', createdAt: Date.now() });
+  lobbies.set(code, {
+    host: ws1, guest: ws2, name: 'Matched', createdAt: Date.now(),
+    host_username: ws1.username, guest_username: ws2.username
+  });
   ws1.lobbyCode = code; ws1.role = 'host';
   ws2.lobbyCode = code; ws2.role = 'guest';
-  send(ws1, { type: 'mm_matched', role: 'host' });
-  send(ws2, { type: 'mm_matched', role: 'guest' });
-  // Auto-start: both sides get started so game launches immediately
-  send(ws1, { type: 'peer_joined' });
-  send(ws2, { type: 'joined' });
+  send(ws1, { type: 'mm_matched', role: 'host', opponent_username: ws2.username });
+  send(ws2, { type: 'mm_matched', role: 'guest', opponent_username: ws1.username });
+  send(ws1, { type: 'peer_joined', guest_username: ws2.username });
+  send(ws2, { type: 'joined',      host_username:  ws1.username });
 }
 
 wss.on('connection', (ws) => {
   ws.lobbyCode = null;
   ws.role      = null;
+  ws.username  = 'Player';
 
   ws.on('message', (raw) => {
     let msg;
@@ -88,8 +72,12 @@ wss.on('connection', (ws) => {
       case 'host': {
         let code;
         do { code = genCode(); } while (lobbies.has(code));
-        const name = (msg.name || '').trim().slice(0, 32) || 'Open Lobby';
-        lobbies.set(code, { host: ws, guest: null, name, createdAt: Date.now() });
+        const name = (msg.name     || '').trim().slice(0, 32) || 'Open Lobby';
+        ws.username = (msg.username || 'Player').trim().slice(0, 20) || 'Player';
+        lobbies.set(code, {
+          host: ws, guest: null, name, createdAt: Date.now(),
+          host_username: ws.username, guest_username: null
+        });
         ws.lobbyCode = code;
         ws.role      = 'host';
         send(ws, { type: 'code', code, name });
@@ -99,13 +87,16 @@ wss.on('connection', (ws) => {
       case 'join': {
         const code  = (msg.code || '').toUpperCase().trim();
         const lobby = lobbies.get(code);
-        if (!lobby)      { send(ws, { type: 'error', msg: 'Lobby not found.' });  return; }
-        if (lobby.guest) { send(ws, { type: 'error', msg: 'Lobby is full.' });    return; }
-        lobby.guest  = ws;
+        if (!lobby)               { send(ws, { type: 'error', msg: 'Lobby not found.' });  return; }
+        if (lobby.guest && lobby.host) { send(ws, { type: 'error', msg: 'Lobby is full.' }); return; }
+        ws.username = (msg.username || 'Player').trim().slice(0, 20) || 'Player';
+        lobby.guest         = ws;
+        lobby.guest_username = ws.username;
         ws.lobbyCode = code;
         ws.role      = 'guest';
-        send(ws,         { type: 'joined' });
-        send(lobby.host, { type: 'peer_joined' });
+        send(ws,         { type: 'joined',      host_username:  lobby.host_username || 'Player' });
+        if (lobby.host)
+          send(lobby.host, { type: 'peer_joined', guest_username: ws.username });
         break;
       }
 
@@ -115,6 +106,7 @@ wss.on('connection', (ws) => {
       }
 
       case 'matchmake': {
+        ws.username = (msg.username || 'Player').trim().slice(0, 20) || 'Player';
         if (mmQueue.includes(ws)) return;
         if (mmQueue.length > 0) {
           const opponent = mmQueue.shift();
@@ -154,7 +146,16 @@ wss.on('connection', (ws) => {
     if (!lobby) return;
     const other = ws.role === 'host' ? lobby.guest : lobby.host;
     send(other, { type: 'peer_left' });
-    lobbies.delete(ws.lobbyCode);
+
+    // Null out the slot — keep lobby alive 60 s so the player can rejoin
+    if (ws.role === 'host') lobby.host  = null;
+    else                    lobby.guest = null;
+
+    const code = ws.lobbyCode;
+    setTimeout(() => {
+      const l = lobbies.get(code);
+      if (l && (!l.host || !l.guest)) lobbies.delete(code);
+    }, 60000);
   });
 
   ws.on('error', () => {});
