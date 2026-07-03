@@ -1,19 +1,141 @@
 /**
- * Hex Prototype — WebSocket Relay Server
+ * Hex Prototype — WebSocket Relay Server + Accounts/Store API
  *
  * Run locally: npm install && node server.js
+ * Requires DATABASE_URL (Postgres) in the environment.
  * Deploy to Render / Railway / Fly.io and set RELAY_URL in NetworkManager.gd.
  */
 
+const http = require('http');
+const express = require('express');
 const WebSocket = require('ws');
+const { pool, migrate, dbEnabled } = require('./db');
+const { hashPassword, verifyPassword, createSession, resolveToken, requireAuth } = require('./auth');
+
 const PORT = process.env.PORT || 8080;
-const wss  = new WebSocket.Server({ port: PORT });
+
+const app = express();
+app.use(express.json());
+
+// Accounts/store need DATABASE_URL. Until it's set, fail those routes cleanly
+// instead of crashing — the WebSocket relay below still runs either way.
+app.use(['/auth', '/account', '/store'], (req, res, next) => {
+  if (!dbEnabled) return res.status(503).json({ error: 'Accounts are not configured on this server yet.' });
+  next();
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 /** code → { host, guest, name, createdAt, host_username, guest_username } */
 const lobbies = new Map();
 
 /** matchmaking queue */
 const mmQueue = [];
+
+// ---------------------------------------------------------------------------
+// REST API — accounts, sessions, store
+// ---------------------------------------------------------------------------
+
+async function getEntitlements(accountId) {
+  const { rows } = await pool.query(
+    `SELECT items.sku FROM entitlements
+     JOIN items ON items.id = entitlements.item_id
+     WHERE entitlements.account_id = $1`,
+    [accountId]
+  );
+  return rows.map((r) => r.sku);
+}
+
+app.post('/auth/register', async (req, res) => {
+  const { username, email, password } = req.body || {};
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: 'username, email, and password are required' });
+  }
+  const trimmedUsername = String(username).trim().slice(0, 20);
+  const trimmedEmail = String(email).trim().toLowerCase().slice(0, 254);
+  if (!trimmedUsername || !trimmedEmail || String(password).length < 8) {
+    return res.status(400).json({ error: 'Invalid username/email, or password too short (min 8 chars)' });
+  }
+
+  try {
+    const passwordHash = await hashPassword(password);
+    const { rows } = await pool.query(
+      'INSERT INTO accounts (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id',
+      [trimmedUsername, trimmedEmail, passwordHash]
+    );
+    const token = await createSession(rows[0].id);
+    res.json({ token, username: trimmedUsername });
+  } catch (err) {
+    if (err.code === '23505') { // unique_violation
+      return res.status(409).json({ error: 'Username or email already taken' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  const { username_or_email, password } = req.body || {};
+  if (!username_or_email || !password) {
+    return res.status(400).json({ error: 'username_or_email and password are required' });
+  }
+  const identifier = String(username_or_email).trim().toLowerCase();
+
+  const { rows } = await pool.query(
+    'SELECT id, username, password_hash FROM accounts WHERE lower(username) = $1 OR email = $1',
+    [identifier]
+  );
+  const account = rows[0];
+  if (!account || !(await verifyPassword(password, account.password_hash))) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  const token = await createSession(account.id);
+  res.json({ token, username: account.username });
+});
+
+app.post('/auth/logout', requireAuth, async (req, res) => {
+  const header = req.get('Authorization') || '';
+  const token = header.slice(7);
+  await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+  res.json({ ok: true });
+});
+
+app.get('/account/me', requireAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT username FROM accounts WHERE id = $1', [req.accountId]);
+  if (!rows.length) return res.status(404).json({ error: 'Account not found' });
+  const entitlements = await getEntitlements(req.accountId);
+  res.json({ username: rows[0].username, entitlements });
+});
+
+app.get('/store/items', async (_req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, sku, name, price_cents FROM items WHERE active = true ORDER BY id'
+  );
+  res.json({ items: rows });
+});
+
+// DEV STUB: grants the entitlement directly with no payment step.
+// Replace with real receipt/payment validation (Steam, mobile IAP, etc.) before
+// this store is exposed to real players — this endpoint currently trusts the
+// caller's item_id completely.
+app.post('/store/purchase', requireAuth, async (req, res) => {
+  const { item_id } = req.body || {};
+  const { rows } = await pool.query('SELECT id, sku FROM items WHERE id = $1 AND active = true', [item_id]);
+  if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+
+  await pool.query(
+    `INSERT INTO entitlements (account_id, item_id, source) VALUES ($1, $2, 'dev_grant')
+     ON CONFLICT (account_id, item_id) DO NOTHING`,
+    [req.accountId, rows[0].id]
+  );
+  const entitlements = await getEntitlements(req.accountId);
+  res.json({ ok: true, entitlements });
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket relay — lobbies + matchmaking
+// ---------------------------------------------------------------------------
 
 function genCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -54,22 +176,35 @@ function startMatchmakedGame(ws1, ws2) {
   ws2.lobbyCode = code; ws2.role = 'guest';
   send(ws1, { type: 'mm_matched', role: 'host', opponent_username: ws2.username });
   send(ws2, { type: 'mm_matched', role: 'guest', opponent_username: ws1.username });
-  send(ws1, { type: 'peer_joined', guest_username: ws2.username });
-  send(ws2, { type: 'joined',      host_username:  ws1.username });
+  send(ws1, { type: 'peer_joined', guest_username: ws2.username, equipped_item_sku: ws2.equippedItemSku });
+  send(ws2, { type: 'joined',      host_username:  ws1.username, equipped_item_sku: ws1.equippedItemSku });
+}
+
+/** Resolves msg.token to an account_id + verified equipped_item_sku (or null for both). */
+async function resolveIdentity(ws, msg) {
+  ws.accountId = await resolveToken(msg.token);
+  ws.equippedItemSku = null;
+  if (ws.accountId && msg.equipped_item_sku) {
+    const owned = await getEntitlements(ws.accountId);
+    if (owned.includes(msg.equipped_item_sku)) ws.equippedItemSku = msg.equipped_item_sku;
+  }
 }
 
 wss.on('connection', (ws) => {
   ws.lobbyCode = null;
   ws.role      = null;
   ws.username  = 'Player';
+  ws.accountId = null;
+  ws.equippedItemSku = null;
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
     switch (msg.type) {
 
       case 'host': {
+        await resolveIdentity(ws, msg);
         let code;
         do { code = genCode(); } while (lobbies.has(code));
         const name = (msg.name     || '').trim().slice(0, 32) || 'Open Lobby';
@@ -85,6 +220,7 @@ wss.on('connection', (ws) => {
       }
 
       case 'join': {
+        await resolveIdentity(ws, msg);
         const code  = (msg.code || '').toUpperCase().trim();
         const lobby = lobbies.get(code);
         if (!lobby)               { send(ws, { type: 'error', msg: 'Lobby not found.' });  return; }
@@ -94,9 +230,9 @@ wss.on('connection', (ws) => {
         lobby.guest_username = ws.username;
         ws.lobbyCode = code;
         ws.role      = 'guest';
-        send(ws,         { type: 'joined',      host_username:  lobby.host_username || 'Player' });
+        send(ws,         { type: 'joined',      host_username:  lobby.host_username || 'Player', equipped_item_sku: lobby.host?.equippedItemSku });
         if (lobby.host)
-          send(lobby.host, { type: 'peer_joined', guest_username: ws.username });
+          send(lobby.host, { type: 'peer_joined', guest_username: ws.username, equipped_item_sku: ws.equippedItemSku });
         break;
       }
 
@@ -106,6 +242,7 @@ wss.on('connection', (ws) => {
       }
 
       case 'matchmake': {
+        await resolveIdentity(ws, msg);
         ws.username = (msg.username || 'Player').trim().slice(0, 20) || 'Player';
         if (mmQueue.includes(ws)) return;
         if (mmQueue.length > 0) {
@@ -161,4 +298,15 @@ wss.on('connection', (ws) => {
   ws.on('error', () => {});
 });
 
-console.log(`Relay server listening on port ${PORT}`);
+if (!dbEnabled) {
+  console.warn('DATABASE_URL not set — accounts/store disabled, relay-only mode.');
+}
+
+migrate()
+  .then(() => {
+    server.listen(PORT, () => console.log(`Relay server listening on port ${PORT}`));
+  })
+  .catch((err) => {
+    console.error('Failed to migrate database:', err);
+    process.exit(1);
+  });
