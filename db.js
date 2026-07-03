@@ -53,6 +53,16 @@ async function migrate() {
       source      TEXT NOT NULL DEFAULT 'purchase',
       PRIMARY KEY (account_id, item_id)
     );
+
+    CREATE TABLE IF NOT EXISTS achievements (
+      account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      achievement_id  TEXT NOT NULL,
+      unlocked_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (account_id, achievement_id)
+    );
+  `);
+  await pool.query(`
+    ALTER TABLE items ADD COLUMN IF NOT EXISTS purchasable BOOLEAN NOT NULL DEFAULT true;
   `);
 }
 

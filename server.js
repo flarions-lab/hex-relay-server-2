@@ -11,6 +11,7 @@ const express = require('express');
 const WebSocket = require('ws');
 const { pool, migrate, dbEnabled } = require('./db');
 const { hashPassword, verifyPassword, createSession, resolveToken, requireAuth } = require('./auth');
+const { ACHIEVEMENT_CATALOG } = require('./achievements');
 
 const PORT = process.env.PORT || 8080;
 
@@ -110,9 +111,42 @@ app.get('/account/me', requireAuth, async (req, res) => {
 
 app.get('/store/items', async (_req, res) => {
   const { rows } = await pool.query(
-    'SELECT id, sku, name, price_cents FROM items WHERE active = true ORDER BY id'
+    'SELECT id, sku, name, price_cents FROM items WHERE active = true AND purchasable = true ORDER BY id'
   );
   res.json({ items: rows });
+});
+
+// Grants every asset an achievement unlocks. Idempotent — safe to call again
+// for an already-unlocked achievement (e.g. AchievementManager.gd syncing
+// local-only progress up on first login).
+app.post('/account/unlock-achievement', requireAuth, async (req, res) => {
+  const { achievement_id } = req.body || {};
+  const rewards = ACHIEVEMENT_CATALOG[achievement_id];
+  if (!rewards) return res.status(400).json({ error: 'Unknown achievement_id' });
+
+  for (const { sku, name } of rewards) {
+    const { rows } = await pool.query(
+      `INSERT INTO items (sku, name, price_cents, purchasable) VALUES ($1, $2, 0, false)
+       ON CONFLICT (sku) DO NOTHING
+       RETURNING id`,
+      [sku, name]
+    );
+    const itemId = rows.length ? rows[0].id : (await pool.query('SELECT id FROM items WHERE sku = $1', [sku])).rows[0].id;
+    await pool.query(
+      `INSERT INTO entitlements (account_id, item_id, source) VALUES ($1, $2, 'achievement')
+       ON CONFLICT (account_id, item_id) DO NOTHING`,
+      [req.accountId, itemId]
+    );
+  }
+
+  await pool.query(
+    `INSERT INTO achievements (account_id, achievement_id) VALUES ($1, $2)
+     ON CONFLICT (account_id, achievement_id) DO NOTHING`,
+    [req.accountId, achievement_id]
+  );
+
+  const entitlements = await getEntitlements(req.accountId);
+  res.json({ ok: true, entitlements });
 });
 
 // DEV STUB: grants the entitlement directly with no payment step.
