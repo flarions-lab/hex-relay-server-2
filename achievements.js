@@ -49,6 +49,8 @@ const ACHIEVEMENT_CATALOG = {
   ],
   defeat_candytech: [
     { sku: 'dronebody_peppermint', name: 'Peppermint Drone Body' },
+    { sku: 'dronebody_swirl', name: 'Swirl Drone Body' },
+    { sku: 'dronebody_redswirl', name: 'Red Swirl Drone Body' },
     { sku: 'sound_ballblamburgler', name: 'Ballblamburgler Sound' },
     { sku: 'sound_explosion', name: 'Explosion Sound' },
   ],
