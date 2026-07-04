@@ -26,8 +26,8 @@ async function migrate() {
     CREATE TABLE IF NOT EXISTS accounts (
       id            SERIAL PRIMARY KEY,
       username      TEXT UNIQUE NOT NULL,
-      email         TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
+      email         TEXT UNIQUE,
+      password_hash TEXT,
       created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
@@ -60,9 +60,22 @@ async function migrate() {
       unlocked_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (account_id, achievement_id)
     );
+
+    CREATE TABLE IF NOT EXISTS platform_identities (
+      id               SERIAL PRIMARY KEY,
+      account_id       INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      platform         TEXT NOT NULL,
+      platform_user_id TEXT NOT NULL,
+      linked_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (platform, platform_user_id)
+    );
   `);
   await pool.query(`
     ALTER TABLE items ADD COLUMN IF NOT EXISTS purchasable BOOLEAN NOT NULL DEFAULT true;
+  `);
+  await pool.query(`
+    ALTER TABLE accounts ALTER COLUMN email DROP NOT NULL;
+    ALTER TABLE accounts ALTER COLUMN password_hash DROP NOT NULL;
   `);
 }
 

@@ -12,6 +12,7 @@ const WebSocket = require('ws');
 const { pool, migrate, dbEnabled } = require('./db');
 const { hashPassword, verifyPassword, createSession, resolveToken, requireAuth } = require('./auth');
 const { ACHIEVEMENT_CATALOG } = require('./achievements');
+const { verifyPlatformToken } = require('./platformAuth');
 
 const PORT = process.env.PORT || 8080;
 
@@ -88,7 +89,7 @@ app.post('/auth/login', async (req, res) => {
     [identifier]
   );
   const account = rows[0];
-  if (!account || !(await verifyPassword(password, account.password_hash))) {
+  if (!account || !account.password_hash || !(await verifyPassword(password, account.password_hash))) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
   const token = await createSession(account.id);
@@ -102,11 +103,95 @@ app.post('/auth/logout', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+async function generateUniqueUsername() {
+  for (let i = 0; i < 10; i++) {
+    const candidate = `Player_${Math.floor(Math.random() * 1e8)}`;
+    const { rows } = await pool.query('SELECT 1 FROM accounts WHERE username = $1', [candidate]);
+    if (!rows.length) return candidate;
+  }
+  throw new Error('Could not generate a unique username');
+}
+
+// Logs in via a Steam/Google Play identity, creating a new account the first
+// time that platform_user_id is seen. See platformAuth.js — token
+// verification is currently a dev stub.
+app.post('/auth/platform-login', async (req, res) => {
+  const { platform, token } = req.body || {};
+  let identity;
+  try {
+    identity = await verifyPlatformToken(platform, token);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  const existing = await pool.query(
+    'SELECT account_id FROM platform_identities WHERE platform = $1 AND platform_user_id = $2',
+    [platform, identity.platform_user_id]
+  );
+
+  let accountId, username;
+  if (existing.rows.length) {
+    accountId = existing.rows[0].account_id;
+    const { rows } = await pool.query('SELECT username FROM accounts WHERE id = $1', [accountId]);
+    username = rows[0].username;
+  } else {
+    // display_name isn't guaranteed unique, so always auto-generate the
+    // account username for now rather than risk a collision on insert.
+    username = await generateUniqueUsername();
+    const { rows } = await pool.query(
+      'INSERT INTO accounts (username) VALUES ($1) RETURNING id',
+      [username]
+    );
+    accountId = rows[0].id;
+    await pool.query(
+      'INSERT INTO platform_identities (account_id, platform, platform_user_id) VALUES ($1, $2, $3)',
+      [accountId, platform, identity.platform_user_id]
+    );
+  }
+
+  const sessionToken = await createSession(accountId);
+  res.json({ token: sessionToken, username });
+});
+
 app.get('/account/me', requireAuth, async (req, res) => {
   const { rows } = await pool.query('SELECT username FROM accounts WHERE id = $1', [req.accountId]);
   if (!rows.length) return res.status(404).json({ error: 'Account not found' });
   const entitlements = await getEntitlements(req.accountId);
   res.json({ username: rows[0].username, entitlements });
+});
+
+// Links a Steam/Google Play identity to the currently-authenticated account.
+app.post('/account/link-platform', requireAuth, async (req, res) => {
+  const { platform, token } = req.body || {};
+  let identity;
+  try {
+    identity = await verifyPlatformToken(platform, token);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  const existing = await pool.query(
+    'SELECT account_id FROM platform_identities WHERE platform = $1 AND platform_user_id = $2',
+    [platform, identity.platform_user_id]
+  );
+  if (existing.rows.length && existing.rows[0].account_id !== req.accountId) {
+    return res.status(409).json({ error: 'That account is already linked to a different HexPrototype account.' });
+  }
+  if (!existing.rows.length) {
+    await pool.query(
+      'INSERT INTO platform_identities (account_id, platform, platform_user_id) VALUES ($1, $2, $3)',
+      [req.accountId, platform, identity.platform_user_id]
+    );
+  }
+  res.json({ ok: true });
+});
+
+app.get('/account/platforms', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT platform FROM platform_identities WHERE account_id = $1',
+    [req.accountId]
+  );
+  res.json({ platforms: rows.map((r) => r.platform) });
 });
 
 app.get('/store/items', async (_req, res) => {
