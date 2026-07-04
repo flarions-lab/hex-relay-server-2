@@ -45,6 +45,7 @@ const ACHIEVEMENT_CATALOG = {
   defeat_microbots: [
     { sku: 'sound_microbot_move', name: 'Microbot Move Sound' },
     { sku: 'sound_servo_whir', name: 'Servo Whir Sound' },
+    { sku: 'screenfx_darken', name: 'Darken Screen Effect' },
   ],
   defeat_candytech: [
     { sku: 'dronebody_peppermint', name: 'Peppermint Drone Body' },
