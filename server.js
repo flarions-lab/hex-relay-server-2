@@ -7,14 +7,17 @@
  */
 
 const http = require('http');
+const path = require('path');
 const express = require('express');
 const WebSocket = require('ws');
 const { pool, migrate, dbEnabled } = require('./db');
 const { hashPassword, verifyPassword, createSession, resolveToken, requireAuth } = require('./auth');
 const { ACHIEVEMENT_CATALOG } = require('./achievements');
 const { verifyPlatformToken } = require('./platformAuth');
+const { VERSION, PCK_FILENAME, PCK_SHA256 } = require('./version');
 
 const PORT = process.env.PORT || 8080;
+const PUBLIC_URL = process.env.PUBLIC_URL || 'https://hex-relay-server-2.onrender.com';
 
 const app = express();
 app.use(express.json());
@@ -25,6 +28,18 @@ app.use(['/auth', '/account', '/store'], (req, res, next) => {
   if (!dbEnabled) return res.status(503).json({ error: 'Accounts are not configured on this server yet.' });
   next();
 });
+
+// Version check — no DB/auth needed. scripts/UpdateManager.gd polls this once
+// per launch. pck_url/sha256 are null until a release is actually published
+// (see version.js's release-process comment).
+app.get('/version', (_req, res) => {
+  res.json({
+    version: VERSION,
+    pck_url: PCK_FILENAME ? `${PUBLIC_URL}/downloads/${PCK_FILENAME}` : null,
+    sha256: PCK_SHA256 || null,
+  });
+});
+app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
