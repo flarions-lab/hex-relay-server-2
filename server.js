@@ -130,6 +130,7 @@ app.post('/auth/platform-login', async (req, res) => {
   );
 
   let accountId, username;
+  let isNewAccount = false;
   if (existing.rows.length) {
     accountId = existing.rows[0].account_id;
     const { rows } = await pool.query('SELECT username FROM accounts WHERE id = $1', [accountId]);
@@ -137,6 +138,7 @@ app.post('/auth/platform-login', async (req, res) => {
   } else {
     // display_name isn't guaranteed unique, so always auto-generate the
     // account username for now rather than risk a collision on insert.
+    isNewAccount = true;
     username = await generateUniqueUsername();
     const { rows } = await pool.query(
       'INSERT INTO accounts (username) VALUES ($1) RETURNING id',
@@ -150,7 +152,11 @@ app.post('/auth/platform-login', async (req, res) => {
   }
 
   const sessionToken = await createSession(accountId);
-  res.json({ token: sessionToken, username });
+  // is_new_account tells the client this identity had never been seen before —
+  // used to warn "if you already have an account elsewhere, log in and link
+  // this platform instead" rather than silently fragmenting progress across
+  // two accounts.
+  res.json({ token: sessionToken, username, is_new_account: isNewAccount });
 });
 
 app.get('/account/me', requireAuth, async (req, res) => {
