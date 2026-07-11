@@ -18,7 +18,7 @@
  */
 
 module.exports = {
-  VERSION: '1.0.9',
-  PCK_URL: 'https://github.com/flarions-lab/hex-relay-server-2/releases/download/v1.0.9/Hex-A-Gone.pck',
-  PCK_SHA256: '7c6ea5ef0bab04b85ffa5b1f8e6a31e3b58ff812456da6f55a0ca2d93e4dba0f',
+  VERSION: '1.0.95',
+  PCK_URL: 'https://github.com/flarions-lab/AssetsandCodeandstuff/releases/download/v1.0.95/Hex-A-Gone.pck',
+  PCK_SHA256: '4ebd079c11deb1129e1251e8df24237d0910cf105c46a7fb68bce7fec621e9c8',
 };
